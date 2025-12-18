@@ -3,12 +3,11 @@ const TelegramBot = require("node-telegram-bot-api");
 const fetch = require("node-fetch");
 
 // --- CONFIGURATION ---
-// Get these from Vercel Environment Variables
 const token = process.env.TELEGRAM_BOT_TOKEN; 
 const admin = process.env.ADMIN_ID; 
-const DATABASE_URL = process.env.FIREBASE_DB_URL; // e.g., https://project.firebaseio.com
-const WEBHOOK_URL = process.env.VERCEL_URL; // e.g., https://your-app.vercel.app
-const REQUIRED_CHANNEL = process.env.REQUIRED_CHANNEL; // e.g., @YourChannel
+const DATABASE_URL = process.env.FIREBASE_DB_URL; 
+const WEBHOOK_URL = process.env.VERCEL_URL; 
+const REQUIRED_CHANNEL = process.env.REQUIRED_CHANNEL; 
 
 const API_BASE = 'https://arsychat-api.metaspace.workers.dev/api';
 const MODELS = {
@@ -22,8 +21,10 @@ const bot = new TelegramBot(token, { webHook: { port: false } });
 const app = express();
 app.use(express.json());
 
-// Set Webhook automatically on first run
-bot.setWebHook(WEBHOOK_URL);
+// Set Webhook on first run
+if (WEBHOOK_URL) {
+    bot.setWebHook(WEBHOOK_URL);
+}
 
 const broadcastSessions = {};
 
@@ -31,13 +32,13 @@ const broadcastSessions = {};
 
 async function saveUserToFirebase(user) {
   const url = `${DATABASE_URL}/users/${user.id}.json`;
-  // We use PATCH to update user info without deleting their selected model
   const payload = {
     id: user.id,
     first_name: user.first_name || "",
     username: user.username || "",
     timestamp: Date.now()
   };
+  // PATCH ensures we don't overwrite current_model
   await fetch(url, {
     method: "PATCH",
     body: JSON.stringify(payload),
@@ -61,14 +62,14 @@ async function updateUserModel(userId, model) {
 }
 
 async function getTotalUsers() {
-  const url = `${DATABASE_URL}/users.json?shallow=true`; // shallow=true is faster
+  const url = `${DATABASE_URL}/users.json?shallow=true`;
   const res = await fetch(url);
   const data = await res.json();
   return data ? Object.keys(data).length : 0;
 }
 
 async function checkMembership(userId) {
-  if (!REQUIRED_CHANNEL) return true; // Skip if no channel set
+  if (!REQUIRED_CHANNEL) return true;
   try {
     const chatMember = await bot.getChatMember(REQUIRED_CHANNEL, userId);
     return ['creator', 'administrator', 'member'].includes(chatMember.status);
@@ -82,7 +83,7 @@ async function checkMembership(userId) {
 app.post("/", async (req, res) => {
   const update = req.body;
   
-  // 1. Handle Callback Queries (Buttons)
+  // Handle Buttons (Callback Queries)
   if (update.callback_query) {
     const query = update.callback_query;
     const chatId = query.message.chat.id;
@@ -90,7 +91,6 @@ app.post("/", async (req, res) => {
     const data = query.data;
 
     if (MODELS[data]) {
-      // Check Membership before setting model
       if (await checkMembership(userId)) {
         await updateUserModel(userId, data);
         await bot.answerCallbackQuery(query.id, { text: `✅ Model set to ${data}` });
@@ -99,18 +99,17 @@ app.post("/", async (req, res) => {
         await bot.answerCallbackQuery(query.id, { text: "❌ Join channel first!", show_alert: true });
       }
     }
-    return res.end("OK");
+    return res.json({ status: "ok" });
   }
 
-  // 2. Handle Messages
   const msg = update.message;
-  if (!msg || !msg.text) return res.end("OK");
+  if (!msg || !msg.text) return res.json({ status: "ok" });
 
   const chatId = msg.chat.id;
   const user = msg.from;
   const userIdString = user.id.toString();
 
-  // --- COMMAND: /start ---
+  // /start Command
   if (msg.text === "/start") {
     const exists = await getUserFromFirebase(user.id);
     
@@ -121,10 +120,10 @@ app.post("/", async (req, res) => {
             inline_keyboard: [[{ text: "📢 Join Channel", url: `https://t.me/${REQUIRED_CHANNEL.replace('@','')}` }]]
         };
         await bot.sendMessage(chatId, `👋 *Hello ${user.first_name}*\n\nPlease join our channel to use this bot.`, { parse_mode: "Markdown", reply_markup: keyboard });
-        return res.end("OK");
+        return res.json({ status: "ok" });
     }
 
-    const text = `*👋 Welcome* [${user.first_name}](tg://user?id=${user.id})\n\n*🧠 Choose an AI Model below to start chatting:*`;
+    const text = `*👋 Welcome* [${user.first_name}](tg://user?id=${user.id})\n\n*🧠 ArsyChat AI*\nChoose an AI Model below to start chatting:`;
     
     const keyboard = {
         inline_keyboard: [
@@ -141,57 +140,49 @@ app.post("/", async (req, res) => {
 
     if (!exists) {
       await saveUserToFirebase(user);
-      const totalUsers = await getTotalUsers();
-      const newUserMsg =
-        "➕ <b>New User Notification</b> ➕\n\n" +
-        "👤<b>User:</b> <a href='tg://user?id=" + user.id + "'>" + user.first_name + "</a>\n" +
-        "🆔<b>ID:</b> <code>" + user.id + "</code>\n" +
-        "🌝 <b>Total Users: " + totalUsers + "</b>";
-      
-      // Send only if admin ID is set
-      if(admin) await bot.sendMessage(admin, newUserMsg, { parse_mode: "HTML" });
+      if(admin) {
+          const totalUsers = await getTotalUsers();
+          const newUserMsg = `➕ <b>New User</b>\n👤 ${user.first_name}\n🆔 ${user.id}\n🌝 Total: ${totalUsers}`;
+          await bot.sendMessage(admin, newUserMsg, { parse_mode: "HTML" }).catch(()=>{});
+      }
     }
   }
 
-  // --- COMMAND: /broadcast ---
+  // /broadcast Command
   else if (msg.text === "/broadcast" && userIdString === admin) {
-    await bot.sendMessage(chatId, "<b>Enter Broadcast Message Here 👇</b>", {
-      parse_mode: "HTML"
-    });
+    await bot.sendMessage(chatId, "<b>Enter Broadcast Message Here 👇</b>", { parse_mode: "HTML" });
     broadcastSessions[chatId] = true;
   } 
   
-  // --- BROADCAST LOGIC ---
+  // Broadcast Execution
   else if (broadcastSessions[chatId] && userIdString === admin) {
     delete broadcastSessions[chatId];
+    await bot.sendMessage(chatId, "🚀 Starting broadcast...");
+    
     const usersUrl = `${DATABASE_URL}/users.json`;
     const resUsers = await fetch(usersUrl);
     const data = await resUsers.json();
     
     if (data) {
-      await bot.sendMessage(chatId, "🚀 Broadcast started...");
       const userIds = Object.keys(data);
       let successCount = 0;
       let failCount = 0;
 
-      // Broadcast loop
       for (const id of userIds) {
         try {
           await bot.copyMessage(id, chatId, msg.message_id);
           successCount++;
-          // Small delay to prevent hitting rate limits
-          await new Promise(r => setTimeout(r, 50)); 
         } catch (e) {
           failCount++;
         }
       }
-      await bot.sendMessage(chatId, `✅ Broadcast completed.\n\n📤 Sent: ${successCount}\n❌ Failed: ${failCount}`);
+      await bot.sendMessage(chatId, `✅ Broadcast Done.\n📤 Sent: ${successCount}\n❌ Failed: ${failCount}`);
     } else {
       await bot.sendMessage(chatId, "❌ No users found.");
     }
   } 
   
-  // --- COMMAND: /model ---
+  // /model Command
   else if (msg.text === "/model") {
       const keyboard = {
         inline_keyboard: [
@@ -202,28 +193,23 @@ app.post("/", async (req, res) => {
       await bot.sendMessage(chatId, "🔄 *Switch AI Model:*", { parse_mode: "Markdown", reply_markup: keyboard });
   }
 
-  // --- AI CHAT LOGIC ---
+  // AI Chat Logic
   else if (msg.text && !msg.text.startsWith('/')) {
     
-    // 1. Check Membership
     if (!(await checkMembership(user.id))) {
-        return bot.sendMessage(chatId, "⚠️ Please join our channel first.", { 
+        return bot.sendMessage(chatId, "⚠️ Join channel first.", { 
             reply_markup: { inline_keyboard: [[{ text: "Join Channel", url: `https://t.me/${REQUIRED_CHANNEL.replace('@','')}` }]] } 
         });
     }
 
-    // 2. Get User & Model
     const userData = await getUserFromFirebase(user.id);
-    
     if (!userData || !userData.current_model) {
-        return bot.sendMessage(chatId, "⚠️ Please select a model first using /model or /start");
+        return bot.sendMessage(chatId, "⚠️ Please select a model first using /model");
     }
 
-    // 3. Call ArsyChat API
     await bot.sendChatAction(chatId, "typing");
     
     const modelSlug = MODELS[userData.current_model];
-    // Encode the prompt
     const apiUrl = `${API_BASE}/${modelSlug}/v1/chat/completions?prompt=${encodeURIComponent(msg.text)}`;
 
     try {
@@ -231,27 +217,20 @@ app.post("/", async (req, res) => {
       const data = await response.json();
       const reply = data.choices?.[0]?.message?.content || "❌ No response from AI.";
       
-      const keyboard = {
-        inline_keyboard: [
-            [{ text: "🔄 Change Model", callback_data: "switch_model_dummy" }] // Dummy button for looks or functionality
-        ]
-      };
-
-      // Try sending markdown, fallback to plain text if syntax error
       try {
           await bot.sendMessage(chatId, reply, { parse_mode: "Markdown" });
       } catch {
           await bot.sendMessage(chatId, reply);
       }
-      
     } catch (e) {
-      await bot.sendMessage(chatId, "❌ API Error. Please try again later.");
+      await bot.sendMessage(chatId, "❌ Error contacting AI.");
     }
   }
 
-  res.end("OK");
+  res.json({ status: "ok" });
 });
 
+// GET Route to check status in browser
 app.get("/", (req, res) => {
   res.send("Bot is Active!");
 });
