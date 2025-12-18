@@ -2,14 +2,14 @@ const express = require("express");
 const TelegramBot = require("node-telegram-bot-api");
 const fetch = require("node-fetch");
 
-// --- CONFIGURATION ---
+// --- ENVIRONMENT VARIABLES ---
 const token = process.env.TELEGRAM_BOT_TOKEN; 
-const admin = process.env.ADMIN_ID; 
 const DATABASE_URL = process.env.FIREBASE_DB_URL; 
-const WEBHOOK_URL = process.env.VERCEL_URL; 
 const REQUIRED_CHANNEL = process.env.REQUIRED_CHANNEL; 
-
+const ADMIN_ID = process.env.ADMIN_ID; 
+const WEBHOOK_URL = process.env.WEBHOOK_URL; // <-- Added this
 const API_BASE = 'https://arsychat-api.metaspace.workers.dev/api';
+
 const MODELS = {
   'GLM': 'glm',
   'DeepSeek': 'deepseek',
@@ -17,222 +17,245 @@ const MODELS = {
   'Kimi': 'kimi'
 };
 
-const bot = new TelegramBot(token, { webHook: { port: false } });
+// INITIALIZE BOT
+const bot = new TelegramBot(token, { polling: false });
 const app = express();
 app.use(express.json());
 
-// Set Webhook on first run
+// --- AUTO SET WEBHOOK ---
+// Agar Environment Variable mein URL hai, to webhook set karo
 if (WEBHOOK_URL) {
-    bot.setWebHook(WEBHOOK_URL);
+    bot.setWebHook(WEBHOOK_URL).then(() => {
+        console.log(`Webhook set to: ${WEBHOOK_URL}`);
+    }).catch(err => {
+        console.error("Webhook Error:", err.message);
+    });
 }
 
+// Broadcast State
 const broadcastSessions = {};
 
-// --- HELPER FUNCTIONS ---
+// --- KEYBOARDS ---
 
-async function saveUserToFirebase(user) {
-  const url = `${DATABASE_URL}/users/${user.id}.json`;
-  const payload = {
-    id: user.id,
-    first_name: user.first_name || "",
-    username: user.username || "",
-    timestamp: Date.now()
-  };
-  // PATCH ensures we don't overwrite current_model
-  await fetch(url, {
-    method: "PATCH",
-    body: JSON.stringify(payload),
-    headers: { "Content-Type": "application/json" }
-  });
+const getJoinKeyboard = () => ({
+    inline_keyboard: [
+        [{ text: "📢 Join Official Channel", url: `https://t.me/${REQUIRED_CHANNEL.replace('@', '')}` }],
+        [{ text: "✅ Verify / I have Joined", callback_data: "check_join" }]
+    ]
+});
+
+const getModelKeyboard = () => ({
+    inline_keyboard: [
+        [{ text: '🤖 GLM-4', callback_data: 'GLM' }, { text: '🧠 DeepSeek', callback_data: 'DeepSeek' }],
+        [{ text: '👁️ Qwen', callback_data: 'Qwen' }, { text: '🌙 Kimi', callback_data: 'Kimi' }]
+    ]
+});
+
+const getBackKeyboard = () => ({
+    inline_keyboard: [
+        [{ text: "🔄 Change Model", callback_data: "back_to_models" }]
+    ]
+});
+
+// --- DATABASE FUNCTIONS ---
+
+async function saveUser(userId, name) {
+    if (!DATABASE_URL) return false;
+    try {
+        const check = await fetch(`${DATABASE_URL}/users/${userId}.json`);
+        const exists = await check.json();
+        
+        await fetch(`${DATABASE_URL}/users/${userId}.json`, {
+            method: 'PATCH',
+            body: JSON.stringify({ id: userId, first_name: name, last_seen: Date.now() }),
+            headers: { 'Content-Type': 'application/json' }
+        });
+        return !exists;
+    } catch (e) { return false; }
 }
 
-async function getUserFromFirebase(userId) {
-  const url = `${DATABASE_URL}/users/${userId}.json`;
-  const res = await fetch(url);
-  return await res.json();
+async function getUser(userId) {
+    if (!DATABASE_URL) return {};
+    try {
+        const res = await fetch(`${DATABASE_URL}/users/${userId}.json`);
+        return await res.json();
+    } catch (e) { return {}; }
 }
 
-async function updateUserModel(userId, model) {
-  const url = `${DATABASE_URL}/users/${userId}.json`;
-  await fetch(url, {
-    method: "PATCH",
-    body: JSON.stringify({ current_model: model }),
-    headers: { "Content-Type": "application/json" }
-  });
+async function setModel(userId, model) {
+    if (!DATABASE_URL) return;
+    try {
+        await fetch(`${DATABASE_URL}/users/${userId}.json`, {
+            method: 'PATCH',
+            body: JSON.stringify({ current_model: model }),
+            headers: { 'Content-Type': 'application/json' }
+        });
+    } catch (e) { console.error(e); }
 }
 
-async function getTotalUsers() {
-  const url = `${DATABASE_URL}/users.json?shallow=true`;
-  const res = await fetch(url);
-  const data = await res.json();
-  return data ? Object.keys(data).length : 0;
+async function getAllUsers() {
+    if (!DATABASE_URL) return [];
+    try {
+        const res = await fetch(`${DATABASE_URL}/users.json`);
+        const data = await res.json();
+        return data ? Object.keys(data) : [];
+    } catch (e) { return []; }
 }
 
 async function checkMembership(userId) {
-  if (!REQUIRED_CHANNEL) return true;
-  try {
-    const chatMember = await bot.getChatMember(REQUIRED_CHANNEL, userId);
-    return ['creator', 'administrator', 'member'].includes(chatMember.status);
-  } catch {
-    return false;
-  }
+    if (!REQUIRED_CHANNEL) return true;
+    try {
+        const chatMember = await bot.getChatMember(REQUIRED_CHANNEL, userId);
+        return ['creator', 'administrator', 'member'].includes(chatMember.status);
+    } catch (e) { return false; }
 }
 
-// --- MAIN ROUTE ---
+// --- MAIN HANDLER ---
 
 app.post("/", async (req, res) => {
-  const update = req.body;
-  
-  // Handle Buttons (Callback Queries)
-  if (update.callback_query) {
-    const query = update.callback_query;
-    const chatId = query.message.chat.id;
-    const userId = query.from.id;
-    const data = query.data;
-
-    if (MODELS[data]) {
-      if (await checkMembership(userId)) {
-        await updateUserModel(userId, data);
-        await bot.answerCallbackQuery(query.id, { text: `✅ Model set to ${data}` });
-        await bot.sendMessage(chatId, `🧠 *Model Switched to ${data}*\n\nSend me a message to start chatting!`, { parse_mode: "Markdown" });
-      } else {
-        await bot.answerCallbackQuery(query.id, { text: "❌ Join channel first!", show_alert: true });
-      }
-    }
-    return res.json({ status: "ok" });
-  }
-
-  const msg = update.message;
-  if (!msg || !msg.text) return res.json({ status: "ok" });
-
-  const chatId = msg.chat.id;
-  const user = msg.from;
-  const userIdString = user.id.toString();
-
-  // /start Command
-  if (msg.text === "/start") {
-    const exists = await getUserFromFirebase(user.id);
-    
-    // Check Membership
-    const isMember = await checkMembership(user.id);
-    if (!isMember) {
-        const keyboard = {
-            inline_keyboard: [[{ text: "📢 Join Channel", url: `https://t.me/${REQUIRED_CHANNEL.replace('@','')}` }]]
-        };
-        await bot.sendMessage(chatId, `👋 *Hello ${user.first_name}*\n\nPlease join our channel to use this bot.`, { parse_mode: "Markdown", reply_markup: keyboard });
-        return res.json({ status: "ok" });
-    }
-
-    const text = `*👋 Welcome* [${user.first_name}](tg://user?id=${user.id})\n\n*🧠 ArsyChat AI*\nChoose an AI Model below to start chatting:`;
-    
-    const keyboard = {
-        inline_keyboard: [
-            [{ text: '🤖 GLM-4', callback_data: 'GLM' }, { text: '🧠 DeepSeek', callback_data: 'DeepSeek' }],
-            [{ text: '👁️ Qwen', callback_data: 'Qwen' }, { text: '🌙 Kimi', callback_data: 'Kimi' }]
-        ]
-    };
-
-    await bot.sendMessage(chatId, text, {
-      parse_mode: "Markdown",
-      disable_web_page_preview: true,
-      reply_markup: keyboard
-    });
-
-    if (!exists) {
-      await saveUserToFirebase(user);
-      if(admin) {
-          const totalUsers = await getTotalUsers();
-          const newUserMsg = `➕ <b>New User</b>\n👤 ${user.first_name}\n🆔 ${user.id}\n🌝 Total: ${totalUsers}`;
-          await bot.sendMessage(admin, newUserMsg, { parse_mode: "HTML" }).catch(()=>{});
-      }
-    }
-  }
-
-  // /broadcast Command
-  else if (msg.text === "/broadcast" && userIdString === admin) {
-    await bot.sendMessage(chatId, "<b>Enter Broadcast Message Here 👇</b>", { parse_mode: "HTML" });
-    broadcastSessions[chatId] = true;
-  } 
-  
-  // Broadcast Execution
-  else if (broadcastSessions[chatId] && userIdString === admin) {
-    delete broadcastSessions[chatId];
-    await bot.sendMessage(chatId, "🚀 Starting broadcast...");
-    
-    const usersUrl = `${DATABASE_URL}/users.json`;
-    const resUsers = await fetch(usersUrl);
-    const data = await resUsers.json();
-    
-    if (data) {
-      const userIds = Object.keys(data);
-      let successCount = 0;
-      let failCount = 0;
-
-      for (const id of userIds) {
-        try {
-          await bot.copyMessage(id, chatId, msg.message_id);
-          successCount++;
-        } catch (e) {
-          failCount++;
-        }
-      }
-      await bot.sendMessage(chatId, `✅ Broadcast Done.\n📤 Sent: ${successCount}\n❌ Failed: ${failCount}`);
-    } else {
-      await bot.sendMessage(chatId, "❌ No users found.");
-    }
-  } 
-  
-  // /model Command
-  else if (msg.text === "/model") {
-      const keyboard = {
-        inline_keyboard: [
-            [{ text: '🤖 GLM-4', callback_data: 'GLM' }, { text: '🧠 DeepSeek', callback_data: 'DeepSeek' }],
-            [{ text: '👁️ Qwen', callback_data: 'Qwen' }, { text: '🌙 Kimi', callback_data: 'Kimi' }]
-        ]
-      };
-      await bot.sendMessage(chatId, "🔄 *Switch AI Model:*", { parse_mode: "Markdown", reply_markup: keyboard });
-  }
-
-  // AI Chat Logic
-  else if (msg.text && !msg.text.startsWith('/')) {
-    
-    if (!(await checkMembership(user.id))) {
-        return bot.sendMessage(chatId, "⚠️ Join channel first.", { 
-            reply_markup: { inline_keyboard: [[{ text: "Join Channel", url: `https://t.me/${REQUIRED_CHANNEL.replace('@','')}` }]] } 
-        });
-    }
-
-    const userData = await getUserFromFirebase(user.id);
-    if (!userData || !userData.current_model) {
-        return bot.sendMessage(chatId, "⚠️ Please select a model first using /model");
-    }
-
-    await bot.sendChatAction(chatId, "typing");
-    
-    const modelSlug = MODELS[userData.current_model];
-    const apiUrl = `${API_BASE}/${modelSlug}/v1/chat/completions?prompt=${encodeURIComponent(msg.text)}`;
-
     try {
-      const response = await fetch(apiUrl, { method: 'GET' });
-      const data = await response.json();
-      const reply = data.choices?.[0]?.message?.content || "❌ No response from AI.";
-      
-      try {
-          await bot.sendMessage(chatId, reply, { parse_mode: "Markdown" });
-      } catch {
-          await bot.sendMessage(chatId, reply);
-      }
-    } catch (e) {
-      await bot.sendMessage(chatId, "❌ Error contacting AI.");
-    }
-  }
+        const update = req.body;
+        bot.processUpdate(update);
 
-  res.json({ status: "ok" });
+        // --- BUTTONS ---
+        if (update.callback_query) {
+            const query = update.callback_query;
+            const chatId = query.message.chat.id;
+            const userId = query.from.id;
+            const data = query.data;
+            const msgId = query.message.message_id;
+
+            if (data === "check_join") {
+                const isMember = await checkMembership(userId);
+                if (isMember) {
+                    try { await bot.deleteMessage(chatId, msgId); } catch(e){}
+                    await bot.answerCallbackQuery(query.id, { text: "✅ Verified!" });
+                    await bot.sendMessage(chatId, "🎉 *Verification Successful!*\n\n🧠 *Select an AI Model:*", { 
+                        parse_mode: "Markdown", 
+                        reply_markup: getModelKeyboard() 
+                    });
+                } else {
+                    await bot.answerCallbackQuery(query.id, { text: "❌ Not Joined Yet!", show_alert: true });
+                }
+            }
+            else if (MODELS[data]) {
+                const isMember = await checkMembership(userId);
+                if (isMember) {
+                    await setModel(userId, data);
+                    try {
+                        await bot.editMessageText(`✅ *Model set to: ${data}*\n\n👇 You can now chat!`, {
+                            chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: getBackKeyboard()
+                        });
+                    } catch (e) {
+                        await bot.sendMessage(chatId, `✅ *Model set to: ${data}*\n\n👇 Start chatting!`, {
+                            parse_mode: "Markdown", reply_markup: getBackKeyboard()
+                        });
+                    }
+                    await bot.answerCallbackQuery(query.id, { text: `Selected: ${data}` });
+                } else {
+                    await bot.answerCallbackQuery(query.id, { text: "⚠️ Join Channel First!", show_alert: true });
+                }
+            }
+            else if (data === "back_to_models") {
+                try {
+                    await bot.editMessageText("🧠 *Choose an AI Model:*", {
+                        chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: getModelKeyboard()
+                    });
+                } catch (e) {
+                    await bot.sendMessage(chatId, "🧠 *Choose an AI Model:*", {
+                        parse_mode: "Markdown", reply_markup: getModelKeyboard()
+                    });
+                }
+                await bot.answerCallbackQuery(query.id);
+            }
+        }
+
+        // --- MESSAGES ---
+        if (update.message) {
+            const msg = update.message;
+            const chatId = msg.chat.id;
+            const text = msg.text;
+            const userId = msg.from.id;
+
+            if (!text) return res.send("OK");
+
+            // /start
+            if (text === "/start") {
+                const isNewUser = await saveUser(userId, msg.from.first_name);
+                if (isNewUser && ADMIN_ID) {
+                    const totalUsers = (await getAllUsers()).length;
+                    await bot.sendMessage(ADMIN_ID, `➕ <b>New User</b>\n👤 ${msg.from.first_name}\n🆔 <code>${userId}</code>\n📊 Total: ${totalUsers}`, { parse_mode: "HTML" }).catch(()=>{});
+                }
+
+                const isMember = await checkMembership(userId);
+                if (!isMember) {
+                    await bot.sendMessage(chatId, `👋 *Hello ${msg.from.first_name}*\n\n🔒 To use this bot, you must join our channel first.`, {
+                        parse_mode: "Markdown", reply_markup: getJoinKeyboard()
+                    });
+                } else {
+                    await bot.sendMessage(chatId, `👋 *Welcome Back!*\n\n🧠 Choose an AI Model:`, {
+                        parse_mode: "Markdown", reply_markup: getModelKeyboard()
+                    });
+                }
+            }
+
+            // /broadcast
+            else if (text === "/broadcast" && userId.toString() === ADMIN_ID) {
+                broadcastSessions[chatId] = true;
+                await bot.sendMessage(chatId, "📣 <b>Broadcast Mode</b>\n\nSend message to broadcast.", { parse_mode: "HTML" });
+            }
+
+            // /model
+            else if (text === "/model") {
+                await bot.sendMessage(chatId, "🔄 *Switch Model:*", { parse_mode: "Markdown", reply_markup: getModelKeyboard() });
+            }
+
+            // Broadcast Logic
+            else if (broadcastSessions[chatId] && userId.toString() === ADMIN_ID) {
+                delete broadcastSessions[chatId];
+                await bot.sendMessage(chatId, "🚀 Starting broadcast...");
+                const users = await getAllUsers();
+                let success = 0, fail = 0;
+                for (const uid of users) {
+                    try {
+                        await bot.copyMessage(uid, chatId, msg.message_id);
+                        success++;
+                        await new Promise(r => setTimeout(r, 30)); 
+                    } catch (e) { fail++; }
+                }
+                await bot.sendMessage(chatId, `✅ <b>Done</b>\nSent: ${success}\nFailed: ${fail}`, { parse_mode: "HTML" });
+            }
+
+            // AI Chat
+            else if (!text.startsWith("/")) {
+                const isMember = await checkMembership(userId);
+                if (!isMember) {
+                    return bot.sendMessage(chatId, "⚠️ *Access Denied*\nPlease verify subscription:", {
+                        parse_mode: "Markdown", reply_markup: getJoinKeyboard()
+                    });
+                }
+
+                const userData = await getUser(userId);
+                const currentModel = userData?.current_model || 'glm'; 
+                await bot.sendChatAction(chatId, "typing");
+                const modelSlug = MODELS[currentModel] || 'glm';
+                const apiUrl = `${API_BASE}/${modelSlug}/v1/chat/completions?prompt=${encodeURIComponent(text)}`;
+
+                try {
+                    const apiRes = await fetch(apiUrl);
+                    const apiData = await apiRes.json();
+                    const reply = apiData.choices?.[0]?.message?.content || "❌ AI Error.";
+                    try { await bot.sendMessage(chatId, reply, { parse_mode: "Markdown" }); } catch { await bot.sendMessage(chatId, reply); }
+                } catch (err) {
+                    await bot.sendMessage(chatId, "❌ Server Error.");
+                }
+            }
+        }
+    } catch (error) { console.error(error); }
+
+    res.status(200).send("OK");
 });
 
-// GET Route to check status in browser
-app.get("/", (req, res) => {
-  res.send("Bot is Active!");
-});
+app.get("/", (req, res) => res.send("Bot Active"));
 
 module.exports = app;
